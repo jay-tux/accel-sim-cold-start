@@ -260,6 +260,34 @@ static bool first_call = true;
 unsigned old_total_insts = 0;
 unsigned old_total_reported_insts = 0;
 
+void dump_kernel_info_to(FILE *f, CUcontext ctx, cuLaunchKernel_params *p, int shmem_static_nbytes, int nregs, int binary_version) {
+  fprintf(f, "-kernel name = %s\n",
+          nvbit_get_func_name(ctx, p->f, true));
+  fprintf(f, "-kernel id = %d\n", kernelid);
+  fprintf(f, "-grid dim = (%d,%d,%d)\n", p->gridDimX,
+          p->gridDimY, p->gridDimZ);
+  fprintf(f, "-block dim = (%d,%d,%d)\n", p->blockDimX,
+          p->blockDimY, p->blockDimZ);
+  fprintf(f, "-shmem = %d\n",
+          shmem_static_nbytes + p->sharedMemBytes);
+  fprintf(f, "-nregs = %d\n", nregs);
+  fprintf(f, "-binary version = %d\n", binary_version);
+  fprintf(f, "-cuda stream id = %lu\n", (uint64_t)p->hStream);
+  fprintf(f, "-shmem base_addr = 0x%016lx\n",
+          (uint64_t)nvbit_get_shmem_base_addr(ctx));
+  fprintf(f, "-local mem base_addr = 0x%016lx\n",
+          (uint64_t)nvbit_get_local_mem_base_addr(ctx));
+  fprintf(f, "-nvbit version = %s\n", NVBIT_VERSION);
+  fprintf(f, "-accelsim tracer version = %s\n", TRACER_VERSION);
+  fprintf(f, "\n");
+
+  fprintf(f,
+          "#traces format = threadblock_x threadblock_y threadblock_z "
+          "warpid_tb PC mask dest_num [reg_dests] opcode src_num "
+          "[reg_srcs] mem_width [adrrescompress?] [mem_addresses]\n");
+  fprintf(f, "\n");
+}
+
 void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
                          const char *name, void *params, CUresult *pStatus) {
 
@@ -363,37 +391,16 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
 
       char buffer[1024];
       sprintf(buffer, std::string(traces_location+"/kernel-%d.trace").c_str(), kernelid);
+      char buffer_mem[1024];
+      sprintf(buffer_mem, std::string(traces_location+"/kernel-mem-%d.trace").c_str(), kernelid);
 
       if (!stop_report) {
         resultsFile = fopen(buffer, "w");
+        memFile = fopen(buffer_mem, "w");
 
-        printf("Writing results to %s\n", buffer);
-
-        fprintf(resultsFile, "-kernel name = %s\n",
-                nvbit_get_func_name(ctx, p->f, true));
-        fprintf(resultsFile, "-kernel id = %d\n", kernelid);
-        fprintf(resultsFile, "-grid dim = (%d,%d,%d)\n", p->gridDimX,
-                p->gridDimY, p->gridDimZ);
-        fprintf(resultsFile, "-block dim = (%d,%d,%d)\n", p->blockDimX,
-                p->blockDimY, p->blockDimZ);
-        fprintf(resultsFile, "-shmem = %d\n",
-                shmem_static_nbytes + p->sharedMemBytes);
-        fprintf(resultsFile, "-nregs = %d\n", nregs);
-        fprintf(resultsFile, "-binary version = %d\n", binary_version);
-        fprintf(resultsFile, "-cuda stream id = %lu\n", (uint64_t)p->hStream);
-        fprintf(resultsFile, "-shmem base_addr = 0x%016lx\n",
-                (uint64_t)nvbit_get_shmem_base_addr(ctx));
-        fprintf(resultsFile, "-local mem base_addr = 0x%016lx\n",
-                (uint64_t)nvbit_get_local_mem_base_addr(ctx));
-        fprintf(resultsFile, "-nvbit version = %s\n", NVBIT_VERSION);
-        fprintf(resultsFile, "-accelsim tracer version = %s\n", TRACER_VERSION);
-        fprintf(resultsFile, "\n");
-
-        fprintf(resultsFile,
-                "#traces format = threadblock_x threadblock_y threadblock_z "
-                "warpid_tb PC mask dest_num [reg_dests] opcode src_num "
-                "[reg_srcs] mem_width [adrrescompress?] [mem_addresses]\n");
-        fprintf(resultsFile, "\n");
+        printf("Writing results to %s (memory file %s)\n", buffer, buffer_mem);
+        dump_kernel_info_to(resultsFile, ctx, p, shmem_static_nbytes, nregs, binary_version);
+        dump_kernel_info_to(memFile, ctx, p, shmem_static_nbytes, nregs, binary_version);
       }
 
       kernelsFile = fopen(kernelslist_location.c_str(), "a");
@@ -457,8 +464,10 @@ void nvbit_at_cuda_event(CUcontext ctx, int is_exit, nvbit_api_cuda_t cbid,
       fprintf(statsFile, "\n");
       fclose(statsFile);
 
-      if (!stop_report)
+      if (!stop_report) {
         fclose(resultsFile);
+        fclose(memFile);
+      }
 
       if (active_from_start && dynamic_kernel_limit_end && kernelid > dynamic_kernel_limit_end)
         active_region = false;
@@ -562,6 +571,88 @@ void base_delta_compress(const uint64_t *addrs, const std::bitset<32> &mask,
   }
 }
 
+void dump_insn_to(FILE *f, inst_trace_t *ma) {
+  fprintf(f, "%d ", ma->cta_id_x);
+  fprintf(f, "%d ", ma->cta_id_y);
+  fprintf(f, "%d ", ma->cta_id_z);
+  fprintf(f, "%d ", ma->warpid_tb);
+  if (print_core_id) {
+    fprintf(f, "%d ", ma->sm_id);
+    fprintf(f, "%d ", ma->warpid_sm);
+  }
+  fprintf(f, "%04x ", ma->vpc); // Print the virtual PC
+  fprintf(f, "%08x ", ma->active_mask & ma->predicate_mask);
+  if (ma->GPRDst >= 0) {
+    fprintf(f, "1 ");
+    fprintf(f, "R%d ", ma->GPRDst);
+  } else
+    fprintf(f, "0 ");
+
+  // Print the opcode.
+  fprintf(f, "%s ", id_to_opcode_map[ma->opcode_id].c_str());
+  unsigned src_count = 0;
+  for (int s = 0; s < MAX_SRC; s++) // GPR srcs count.
+    if (ma->GPRSrcs[s] >= 0)
+      src_count++;
+  fprintf(f, "%d ", src_count);
+
+  for (int s = 0; s < MAX_SRC; s++) // GPR srcs.
+    if (ma->GPRSrcs[s] >= 0)
+      fprintf(f, "R%d ", ma->GPRSrcs[s]);
+
+  // print addresses
+  std::bitset<32> mask(ma->active_mask & ma->predicate_mask);
+  if (ma->is_mem) {
+    std::istringstream iss(id_to_opcode_map[ma->opcode_id]);
+    std::vector<std::string> tokens;
+    std::string token;
+    while (std::getline(iss, token, '.')) {
+      if (!token.empty())
+        tokens.push_back(token);
+    }
+    fprintf(f, "%d ", get_datawidth_from_opcode(tokens));
+
+    bool base_stride_success = false;
+    uint64_t base_addr = 0;
+    int stride = 0;
+    std::vector<long long> deltas;
+
+    if (enable_compress) {
+      // try base+stride format
+      base_stride_success =
+          base_stride_compress(ma->addrs, mask, base_addr, stride);
+      if (!base_stride_success) {
+        // if base+stride fails, try base+delta format
+        base_delta_compress(ma->addrs, mask, base_addr, deltas);
+      }
+    }
+
+    if (base_stride_success && enable_compress) {
+      // base + stride format
+      fprintf(f, "%u 0x%llx %d ", address_format::base_stride,
+              base_addr, stride);
+    } else if (!base_stride_success && enable_compress) {
+      // base + delta format
+      fprintf(f, "%u 0x%llx ", address_format::base_delta,
+              base_addr);
+      for (int s = 0; s < deltas.size(); s++) {
+        fprintf(f, "%lld ", deltas[s]);
+      }
+    } else {
+      // list all the addresses
+      fprintf(f, "%u ", address_format::list_all);
+      for (int s = 0; s < 32; s++) {
+        if (mask.test(s))
+          fprintf(f, "0x%016lx ", ma->addrs[s]);
+      }
+    }
+  } else {
+    fprintf(f, "0 ");
+  }
+
+  fprintf(f, "\n");
+}
+
 void *recv_thread_fun(void *) {
   char *recv_buffer = (char *)malloc(CHANNEL_SIZE);
 
@@ -580,85 +671,8 @@ void *recv_thread_fun(void *) {
           break;
         }
 
-        fprintf(resultsFile, "%d ", ma->cta_id_x);
-        fprintf(resultsFile, "%d ", ma->cta_id_y);
-        fprintf(resultsFile, "%d ", ma->cta_id_z);
-        fprintf(resultsFile, "%d ", ma->warpid_tb);
-        if (print_core_id) {
-          fprintf(resultsFile, "%d ", ma->sm_id);
-          fprintf(resultsFile, "%d ", ma->warpid_sm);
-        }
-        fprintf(resultsFile, "%04x ", ma->vpc); // Print the virtual PC
-        fprintf(resultsFile, "%08x ", ma->active_mask & ma->predicate_mask);
-        if (ma->GPRDst >= 0) {
-          fprintf(resultsFile, "1 ");
-          fprintf(resultsFile, "R%d ", ma->GPRDst);
-        } else
-          fprintf(resultsFile, "0 ");
-
-        // Print the opcode.
-        fprintf(resultsFile, "%s ", id_to_opcode_map[ma->opcode_id].c_str());
-        unsigned src_count = 0;
-        for (int s = 0; s < MAX_SRC; s++) // GPR srcs count.
-          if (ma->GPRSrcs[s] >= 0)
-            src_count++;
-        fprintf(resultsFile, "%d ", src_count);
-
-        for (int s = 0; s < MAX_SRC; s++) // GPR srcs.
-          if (ma->GPRSrcs[s] >= 0)
-            fprintf(resultsFile, "R%d ", ma->GPRSrcs[s]);
-
-        // print addresses
-        std::bitset<32> mask(ma->active_mask & ma->predicate_mask);
-        if (ma->is_mem) {
-          std::istringstream iss(id_to_opcode_map[ma->opcode_id]);
-          std::vector<std::string> tokens;
-          std::string token;
-          while (std::getline(iss, token, '.')) {
-            if (!token.empty())
-              tokens.push_back(token);
-          }
-          fprintf(resultsFile, "%d ", get_datawidth_from_opcode(tokens));
-
-          bool base_stride_success = false;
-          uint64_t base_addr = 0;
-          int stride = 0;
-          std::vector<long long> deltas;
-
-          if (enable_compress) {
-            // try base+stride format
-            base_stride_success =
-                base_stride_compress(ma->addrs, mask, base_addr, stride);
-            if (!base_stride_success) {
-              // if base+stride fails, try base+delta format
-              base_delta_compress(ma->addrs, mask, base_addr, deltas);
-            }
-          }
-
-          if (base_stride_success && enable_compress) {
-            // base + stride format
-            fprintf(resultsFile, "%u 0x%llx %d ", address_format::base_stride,
-                    base_addr, stride);
-          } else if (!base_stride_success && enable_compress) {
-            // base + delta format
-            fprintf(resultsFile, "%u 0x%llx ", address_format::base_delta,
-                    base_addr);
-            for (int s = 0; s < deltas.size(); s++) {
-              fprintf(resultsFile, "%lld ", deltas[s]);
-            }
-          } else {
-            // list all the addresses
-            fprintf(resultsFile, "%u ", address_format::list_all);
-            for (int s = 0; s < 32; s++) {
-              if (mask.test(s))
-                fprintf(resultsFile, "0x%016lx ", ma->addrs[s]);
-            }
-          }
-        } else {
-          fprintf(resultsFile, "0 ");
-        }
-
-        fprintf(resultsFile, "\n");
+        dump_insn_to(resultsFile, ma);
+        if(ma->is_mem || ma->opcode_id == opcode_to_id_map["EXIT"]) dump_insn_to(memFile, ma);
 
         num_processed_bytes += sizeof(inst_trace_t);
       }
